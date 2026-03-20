@@ -97,7 +97,15 @@ async fn dispatch(raw: &str, state: &SharedState) -> JsonRpcResponse {
         "task/info" => tools::task_info(&params, &state.task_store, &state.broker_secret),
         "task/revoke" => tools::task_revoke(&params, &state.task_store, &state.broker_secret),
         "policy/get" => tools::policy_get(&state.policy_engine).await,
-        "ssh/request_cert" => tools::ssh_request_cert(&params),
+        "ssh/request_cert" => {
+            tools::ssh_request_cert(
+                &params,
+                &state.vault_client,
+                &state.task_store,
+                &state.broker_secret,
+            )
+            .await
+        }
         _ => Err((
             ERR_METHOD_NOT_FOUND,
             format!("method not found: {}", req.method),
@@ -278,11 +286,110 @@ mod tests {
         assert_eq!(err.0, ERR_APPLICATION);
     }
 
-    #[test]
-    fn test_ssh_request_cert_stub() {
-        let params = json!({ "token": "tok", "public_key": "ssh-ed25519 AAAA..." });
-        let result = tools::ssh_request_cert(&params).unwrap();
-        assert_eq!(result["status"], "not_implemented");
+    #[tokio::test]
+    async fn test_ssh_request_cert_missing_token() {
+        let (store, _f) = open_store();
+        let state = make_state(store);
+        let raw = r#"{"jsonrpc":"2.0","id":1,"method":"ssh/request_cert","params":{"public_key":"ssh-ed25519 AAAA...","principals":["ubuntu"],"ttl_secs":3600}}"#;
+        let resp = dispatch(raw, &state).await;
+        let err = resp.error.expect("expected error");
+        // missing token → invalid params
+        assert_eq!(err.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn test_ssh_principal_not_in_scopes() {
+        let (store, _f) = open_store();
+        let scopes = TaskScopes {
+            ssh_targets: vec!["ubuntu".to_string()],
+            ..full_scopes()
+        };
+        let record = store.insert_root("install-ssh-scope", scopes).unwrap();
+        let tok = token::mint(&record, SECRET).unwrap();
+
+        let params = json!({
+            "token": tok,
+            "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA",
+            "principals": ["root"],
+            "ttl_secs": 3600,
+        });
+        let err = tools::ssh_request_cert(&params, &None, &store, SECRET)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, -32000);
+        assert!(
+            err.1.contains("not in allowed"),
+            "unexpected error: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssh_wildcard_allows_any() {
+        let (store, _f) = open_store();
+        let scopes = TaskScopes {
+            ssh_targets: vec!["*".to_string()],
+            ..full_scopes()
+        };
+        let record = store.insert_root("install-ssh-wildcard", scopes).unwrap();
+        let tok = token::mint(&record, SECRET).unwrap();
+
+        let params = json!({
+            "token": tok,
+            "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA",
+            "principals": ["root", "ubuntu", "deploy"],
+            "ttl_secs": 3600,
+        });
+        // Validation passes; Vault is not configured → error is about Vault, not principals.
+        let err = tools::ssh_request_cert(&params, &None, &store, SECRET)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, -32000);
+        assert!(
+            err.1.contains("not configured") || err.1.contains("Vault"),
+            "unexpected error: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssh_empty_public_key() {
+        let (store, _f) = open_store();
+        let params = json!({
+            "token": "any-token",
+            "public_key": "",
+            "principals": ["ubuntu"],
+            "ttl_secs": 3600,
+        });
+        let err = tools::ssh_request_cert(&params, &None, &store, SECRET)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, -32602);
+        assert!(
+            err.1.contains("empty") || err.1.contains("public_key"),
+            "unexpected error: {}",
+            err.1
+        );
+    }
+
+    /// Integration test — requires a live Vault instance with SSH secrets engine.
+    /// Run manually with: `cargo test test_ssh_vault_integration -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn test_ssh_vault_integration() {
+        use crate::security::vault_client::VaultClient;
+        let vc = VaultClient::from_env()
+            .expect("env error")
+            .expect("VAULT_ADDRESS/VAULT_TOKEN/VAULT_AGENT_PATH_PREFIX must be set");
+        let result = vc
+            .sign_ssh_key(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIntegrationTestKey",
+                &["ubuntu".to_string()],
+                300,
+            )
+            .await;
+        // Expect success when Vault SSH engine is properly configured.
+        assert!(result.is_ok(), "vault error: {:?}", result.err());
     }
 
     // ── Helper to build a minimal SharedState for dispatch tests ─────────────

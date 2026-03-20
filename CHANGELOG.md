@@ -1,6 +1,33 @@
 # Changelog
 
-## Unreleased — Extended Audit Log with Agent Events and Stacker Relay
+## Unreleased — Vault SSH Certificate Signing for Ephemeral Agent Credentials
+### Added
+
+- **`VaultClient::sign_ssh_key`** in `src/security/vault_client.rs`:
+  - Signs an ephemeral SSH public key via the Vault SSH Secrets Engine.
+  - Reads `VAULT_SSH_MOUNT` and `VAULT_SSH_ROLE` environment variables at call time.
+  - Returns `SshCertResponse { signed_key, serial_number, lease_duration }`.
+- **`SshCertResponse`** struct (public, serializable) exported from `vault_client`.
+- **`ssh/request_cert` MCP tool** (replaces stub) in `src/mcp/tools.rs`:
+  - Verifies the task token via `token::verify()`.
+  - Checks every requested principal against `claims.scopes.ssh_targets` (exact match or `"*"` wildcard).
+  - Calls `VaultClient::sign_ssh_key` and returns `{ signed_key, serial_number, lease_duration }`.
+  - Returns `-32602` for invalid input params; `-32000` for auth/scope/Vault errors.
+- `ssh_principal_allowed` internal helper (glob-free exact + wildcard matching).
+- **Unit tests** in `src/mcp/mod.rs`:
+  - `test_ssh_request_cert_missing_token` — missing token field → `-32602`.
+  - `test_ssh_principal_not_in_scopes` — principal `"root"` not in `["ubuntu"]` → `-32000`.
+  - `test_ssh_wildcard_allows_any` — `ssh_targets: ["*"]` passes validation for any principal.
+  - `test_ssh_empty_public_key` — empty `public_key` → `-32602`.
+  - `test_ssh_vault_integration` — live Vault round-trip (marked `#[ignore]`).
+- **Unit tests** in `src/mcp/tools.rs`:
+  - `test_ssh_principal_allowed_exact_match`, `test_ssh_principal_allowed_wildcard`, `test_ssh_principal_allowed_empty_targets`.
+
+### Changed
+
+- `ssh/request_cert` dispatch in `src/mcp/mod.rs` now passes `vault_client`, `task_store`, and `broker_secret` to the (now async) handler.
+
+
 ### Added
 
 - **`AuditEvent` enum** in `src/security/audit_log.rs`:

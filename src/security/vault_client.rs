@@ -59,6 +59,33 @@ use tracing::{debug, info, warn};
 // These structures mirror Vault's KV v2 API response format.
 // Vault wraps all data in {"data": {"data": {...}, "metadata": {...}}} envelopes.
 
+// ── SSH Secrets Engine response types ────────────────────────────────────────
+
+/// Response envelope from the Vault SSH Secrets Engine sign endpoint.
+#[derive(Debug, Deserialize)]
+struct VaultSshSignResponse {
+    data: VaultSshSignData,
+}
+
+#[derive(Debug, Deserialize)]
+struct VaultSshSignData {
+    signed_key: String,
+    serial_number: String,
+    #[serde(default)]
+    lease_duration: u64,
+}
+
+/// Public response returned from [`VaultClient::sign_ssh_key`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshCertResponse {
+    /// The signed SSH certificate (`ssh-rsa-cert-v01@openssh.com ...`).
+    pub signed_key: String,
+    /// Vault-generated certificate serial number (for audit/revocation).
+    pub serial_number: String,
+    /// Validity duration in seconds as reported by Vault.
+    pub lease_duration: u64,
+}
+
 /// Vault KV response envelope for token fetch.
 /// Security Note: Token responses are parsed strictly to prevent injection attacks.
 #[derive(Debug, Deserialize)]
@@ -895,6 +922,89 @@ impl VaultClient {
         }
 
         Ok(configs)
+    }
+
+    // =========================================================================
+    // SSH Secrets Engine
+    // =========================================================================
+
+    /// Sign an ephemeral SSH public key via the Vault SSH Secrets Engine.
+    ///
+    /// ## Environment Variables Required
+    ///
+    /// | Variable | Description | Example |
+    /// |----------|-------------|---------|
+    /// | `VAULT_SSH_MOUNT` | SSH secrets engine mount path | `ssh-client-signer` |
+    /// | `VAULT_SSH_ROLE` | SSH signing role | `trydirect-agent` |
+    ///
+    /// ## Vault API
+    ///
+    /// `POST {VAULT_ADDR}/v1/{VAULT_SSH_MOUNT}/sign/{VAULT_SSH_ROLE}`
+    ///
+    /// ## Security Notes
+    ///
+    /// - The signed certificate is valid only for the requested `principals`.
+    /// - `ttl_secs` is enforced server-side; the caller should request the
+    ///   minimum viable TTL (default: 3600 seconds).
+    /// - The public key is never persisted; only the signed certificate is returned.
+    pub async fn sign_ssh_key(
+        &self,
+        public_key: &str,
+        principals: &[String],
+        ttl_secs: u64,
+    ) -> Result<SshCertResponse> {
+        let ssh_mount =
+            std::env::var("VAULT_SSH_MOUNT").context("VAULT_SSH_MOUNT env var not set")?;
+        let ssh_role = std::env::var("VAULT_SSH_ROLE").context("VAULT_SSH_ROLE env var not set")?;
+
+        let url = format!("{}/v1/{}/sign/{}", self.base_url, ssh_mount, ssh_role);
+
+        let principals_str = principals.join(",");
+        let ttl = format!("{}s", ttl_secs);
+
+        let body = serde_json::json!({
+            "public_key": public_key,
+            "valid_principals": principals_str,
+            "ttl": ttl,
+            "cert_type": "user",
+        });
+
+        debug!("Signing SSH key via Vault: {}", url);
+
+        let response = self
+            .http_client
+            .post(&url)
+            .header("X-Vault-Token", &self.token)
+            .json(&body)
+            .send()
+            .await
+            .context("sending Vault SSH sign request")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Vault SSH sign failed with status {}: {}",
+                status,
+                body_text
+            ));
+        }
+
+        let vault_resp: VaultSshSignResponse = response
+            .json()
+            .await
+            .context("parsing Vault SSH sign response")?;
+
+        info!(
+            "SSH certificate issued: serial={}, ttl={}s",
+            vault_resp.data.serial_number, vault_resp.data.lease_duration
+        );
+
+        Ok(SshCertResponse {
+            signed_key: vault_resp.data.signed_key,
+            serial_number: vault_resp.data.serial_number,
+            lease_duration: vault_resp.data.lease_duration,
+        })
     }
 }
 
