@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased — Extended Audit Log with Agent Events and Stacker Relay
+### Added
+
+- **`AuditEvent` enum** in `src/security/audit_log.rs`:
+  - `AgentTaskCreated` — fires when an agent task is created (root or child).
+  - `AgentTaskRevoked` — fires on revocation, includes cascade count.
+  - `AgentTokenVerified` — records token verification success/failure per method.
+  - `AgentProxyRequest` — records proxy requests (host-only for privacy), status, and whether blocked.
+  - `AgentDelegation` — records parent→child delegation with scope reduction summary.
+- **`AuditLogger::with_store(Arc<TaskStore>)`** — creates a logger that also buffers agent events to SQLite.
+- **`AuditLogger::log_agent_event(event: AuditEvent)`** — emits via `tracing` and writes to the buffer table when a store is attached.
+- **`agent_audit_buffer` SQLite table** (in the existing task DB):
+  - Schema: `id`, `event_type`, `payload` (JSON), `created_at`, `relayed_at` (NULL until sent).
+- **`TaskStore::buffer_audit_event`**, **`fetch_unrelayed_events`**, **`mark_events_relayed`** — buffer, query, and mark relay status.
+- **`src/comms/stacker_relay.rs`** — background relay loop (`spawn_audit_relay`):
+  - Runs every 30 seconds, batches up to 50 events.
+  - POSTs to `{STACKER_URL}/api/v1/agent/audit` with `X-Internal-Key` auth.
+  - On success marks events relayed; on failure logs warning and retries next cycle.
+  - Gracefully skips when `STACKER_URL` is not set.
+- **`GET /audit/recent?limit=50`** — internal endpoint to query unrelayed audit events.
+  - Returns `[{"id", "event_type", "payload", "created_at"}]`.
+  - Wired in `src/comms/local_api.rs`.
+- **`AppState`** now initializes `AuditLogger::with_store(task_store.clone())` so all agent events are automatically buffered.
+- **Task DB fallback**: if the configured `TASK_DB_PATH` can't be opened, falls back to an in-memory SQLite store (with a warning log) instead of panicking.
+- **4 new unit tests** in `security::audit_log::tests`:
+  - `test_audit_log_agent_task_created` — buffer round-trip with field validation.
+  - `test_audit_log_proxy_request` — proxy event fields verified.
+  - `test_audit_logger_without_store_does_not_panic` — logger works without a store.
+  - `test_existing_methods_still_work` — backward compatibility.
+- **2 new unit tests** in `task::store::tests`:
+  - `test_buffer_and_fetch_events` — buffer 3 events, fetch returns all 3.
+  - `test_mark_relayed_filters_out` — mark 2 relayed, only 1 returned.
+
 ## Unreleased — HTTP Proxy with SSRF Protection and Scope Enforcement
 ### Added — `proxy` module
 
