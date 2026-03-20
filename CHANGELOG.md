@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased — Structured Policy Engine (Agent Broker)
+### Changed / Added — `security::scopes` module
+
+- **`PolicyEngine`** — new structured policy evaluator held in `Arc<RwLock<Option<PolicyEngine>>>` in `AppState`.
+  - `PolicyEngine::load(stack_code, stacker_url, installation_hash)` — fetches the policy from Stacker at startup (`GET {stacker_url}/stacks/{stack_code}/agent_policy`) using `X-Internal-Key` header from `INTERNAL_SERVICES_ACCESS_KEY`.
+  - `PolicyEngine::refresh()` — re-fetches the policy; called by a background tokio task every 300 seconds.
+  - `PolicyEngine::validate_scopes(requested: &TaskScopes)` — enforces stack-level policy bounds: SSH target glob matching, HTTP allow glob matching, TryDirect ops exact match, `max_depth` and `max_sub_agents` ceiling checks.
+  - `PolicyEngine::glob_match` / `matches_pattern` — pure-Rust glob matcher: `*` matches non-`/` chars, `**` crosses path separators, `?` matches one non-`/` char.
+- **`StackPolicy`** / **`PolicyScopes`** — serde-serialisable structs mirroring the Stacker `GET /stacks/{code}/agent_policy` response.
+- **Legacy `Scopes`** struct preserved unchanged for backward compatibility.
+- **`AppState`** updated with `policy_engine: Arc<RwLock<Option<PolicyEngine>>>` field (initialised to `None`).
+- **`serve()`** updated to: attempt `PolicyEngine::load` if `STACKER_URL` and `STACK_CODE` env vars are set; log a warning (not a fatal error) if loading fails; spawn the 5-minute refresh background task unconditionally.
+- **New env vars** consumed: `STACKER_URL`, `STACK_CODE`, `INTERNAL_SERVICES_ACCESS_KEY` (already required by other services), `INSTALLATION_HASH` (already present).
+- **6 unit tests** in `security::scopes::tests`: glob wildcard, double-star, no-match, validate within policy, SSH target rejection, TryDirect op rejection.
+
 ## Unreleased — Task Token Engine (Agent Broker)
 ### Added — `task::token` module (sp-task-token)
 
