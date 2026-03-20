@@ -22,6 +22,14 @@ CREATE TABLE IF NOT EXISTS agent_task (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_task_parent ON agent_task(parent_id);
 CREATE INDEX IF NOT EXISTS idx_agent_task_installation ON agent_task(installation_id);
+
+CREATE TABLE IF NOT EXISTS agent_audit_buffer (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type  TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    relayed_at  INTEGER
+);
 ";
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -85,6 +93,12 @@ pub fn attenuate(parent: &TaskScopes, requested: &TaskScopes) -> TaskScopes {
 
 pub struct TaskStore {
     conn: Mutex<Connection>,
+}
+
+impl std::fmt::Debug for TaskStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskStore").finish_non_exhaustive()
+    }
 }
 
 impl TaskStore {
@@ -256,6 +270,64 @@ impl TaskStore {
 
         info!(task_id, revoked = count, "revoke_cascade completed");
         Ok(count)
+    }
+
+    /// Buffer an audit event for later relay to Stacker.
+    ///
+    /// Returns the row id of the newly inserted buffer entry.
+    pub fn buffer_audit_event(&self, event_type: &str, payload: &str) -> Result<i64> {
+        let now = unix_now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_audit_buffer (event_type, payload, created_at) VALUES (?1, ?2, ?3)",
+            params![event_type, payload, now],
+        )
+        .context("buffer_audit_event insert")?;
+        let id = conn.last_insert_rowid();
+        Ok(id)
+    }
+
+    /// Fetch up to `limit` audit events that have not yet been relayed.
+    ///
+    /// Returns `(id, event_type, payload, created_at)` tuples ordered by id.
+    pub fn fetch_unrelayed_events(&self, limit: usize) -> Result<Vec<(i64, String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, event_type, payload, created_at \
+                 FROM agent_audit_buffer \
+                 WHERE relayed_at IS NULL \
+                 ORDER BY id ASC \
+                 LIMIT ?1",
+            )
+            .context("prepare fetch_unrelayed_events")?;
+
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .context("query fetch_unrelayed_events")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect unrelayed events")?;
+
+        Ok(rows)
+    }
+
+    /// Mark a set of audit events as successfully relayed (sets `relayed_at` to now).
+    pub fn mark_events_relayed(&self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let now = unix_now();
+        let conn = self.conn.lock().unwrap();
+        for id in ids {
+            conn.execute(
+                "UPDATE agent_audit_buffer SET relayed_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )
+            .with_context(|| format!("mark_events_relayed id={id}"))?;
+        }
+        Ok(())
     }
 
     /// Count active tasks for a given installation.
@@ -454,5 +526,48 @@ mod tests {
 
         store.revoke_cascade(&root.task_id).unwrap();
         assert_eq!(store.get_active_count("install-6").unwrap(), 0);
+    }
+
+    // ── Audit buffer tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_buffer_and_fetch_events() {
+        let (store, _f) = open_store();
+        store
+            .buffer_audit_event("AgentTaskCreated", r#"{"task_id":"t1"}"#)
+            .unwrap();
+        store
+            .buffer_audit_event("AgentTaskRevoked", r#"{"task_id":"t2"}"#)
+            .unwrap();
+        store
+            .buffer_audit_event("AgentProxyRequest", r#"{"task_id":"t3"}"#)
+            .unwrap();
+
+        let events = store.fetch_unrelayed_events(100).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].1, "AgentTaskCreated");
+        assert_eq!(events[1].1, "AgentTaskRevoked");
+        assert_eq!(events[2].1, "AgentProxyRequest");
+    }
+
+    #[test]
+    fn test_mark_relayed_filters_out() {
+        let (store, _f) = open_store();
+        let id1 = store
+            .buffer_audit_event("AgentTaskCreated", r#"{"a":1}"#)
+            .unwrap();
+        let id2 = store
+            .buffer_audit_event("AgentTokenVerified", r#"{"b":2}"#)
+            .unwrap();
+        store
+            .buffer_audit_event("AgentDelegation", r#"{"c":3}"#)
+            .unwrap();
+
+        // Mark first two as relayed
+        store.mark_events_relayed(&[id1, id2]).unwrap();
+
+        let remaining = store.fetch_unrelayed_events(100).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].1, "AgentDelegation");
     }
 }

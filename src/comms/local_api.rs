@@ -45,9 +45,11 @@ use crate::commands::{
     execute_stacker_command, parse_stacker_command, CommandValidator, DockerOperation,
     TimeoutStrategy,
 };
+use crate::mcp::mcp_ws_handler;
 use crate::monitoring::{
     spawn_heartbeat, MetricsCollector, MetricsSnapshot, MetricsStore, MetricsTx,
 };
+use crate::proxy::proxy_handler;
 use crate::security::audit_log::AuditLogger;
 use crate::security::auth::{Credentials, SessionStore, SessionUser};
 use crate::security::rate_limit::RateLimiter;
@@ -57,6 +59,7 @@ use crate::security::scopes::{PolicyEngine, Scopes};
 use crate::security::token_cache::TokenCache;
 use crate::security::token_refresh::spawn_token_refresh;
 use crate::security::vault_client::VaultClient;
+use crate::task::store::TaskStore;
 use crate::transport::{Command as AgentCommand, CommandResult};
 use crate::VERSION;
 
@@ -126,6 +129,12 @@ pub struct AppState {
     /// Structured stack policy engine, loaded from Stacker and refreshed every 5 minutes.
     /// `None` when `STACKER_URL` / `STACK_CODE` are not configured.
     pub policy_engine: Arc<tokio::sync::RwLock<Option<PolicyEngine>>>,
+    /// SQLite-backed store for agent task records (used by the MCP endpoint).
+    pub task_store: Arc<TaskStore>,
+    /// HMAC secret for minting and verifying task tokens (from `BROKER_SECRET` env var).
+    pub broker_secret: Vec<u8>,
+    /// Shared HTTP client for the proxy endpoint (30-second timeout, reuses connections).
+    pub http_client: reqwest::Client,
 }
 
 impl AppState {
@@ -156,6 +165,20 @@ impl AppState {
 
         let firewall_policy = FirewallPolicy::from_config(&config, api_port);
 
+        let task_db_path = std::env::var("TASK_DB_PATH")
+            .unwrap_or_else(|_| "/var/lib/status-panel/tasks.db".to_string());
+        let task_store = Arc::new(TaskStore::new(&task_db_path).unwrap_or_else(|e| {
+            warn!(
+                error = %e,
+                path = %task_db_path,
+                "failed to open task DB at configured path, falling back to in-memory store"
+            );
+            TaskStore::new(":memory:").expect("in-memory task DB must always succeed")
+        }));
+        let broker_secret = std::env::var("BROKER_SECRET")
+            .unwrap_or_default()
+            .into_bytes();
+
         Self {
             session_store: SessionStore::new(),
             config,
@@ -168,7 +191,7 @@ impl AppState {
             backup_path: std::env::var("BACKUP_PATH").ok(),
             commands_queue: Arc::new(Mutex::new(VecDeque::new())),
             commands_notify: Arc::new(Notify::new()),
-            audit: AuditLogger::new(),
+            audit: AuditLogger::with_store(task_store.clone()),
             rate_limiter: RateLimiter::new_per_minute(
                 std::env::var("RATE_LIMIT_PER_MIN")
                     .ok()
@@ -190,7 +213,29 @@ impl AppState {
             update_jobs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             firewall_policy,
             policy_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            task_store,
+            broker_secret,
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("failed to build HTTP client"),
         }
+    }
+
+    /// Construct an `AppState` with an externally supplied `TaskStore` and broker secret.
+    /// Used in unit tests to inject an in-memory store.
+    #[cfg(test)]
+    pub fn new_with_task_store(
+        config: Arc<Config>,
+        with_ui: bool,
+        api_port: Option<u16>,
+        task_store: Arc<TaskStore>,
+        broker_secret: Vec<u8>,
+    ) -> Self {
+        let mut state = Self::new(config, with_ui, api_port);
+        state.task_store = task_store;
+        state.broker_secret = broker_secret;
+        state
     }
 }
 
@@ -1250,6 +1295,15 @@ pub fn create_router(state: SharedState) -> Router {
         .route("/link/select", post(link_select_handler))
         .route("/link/unlink", post(unlink_handler));
 
+    // MCP (Model Context Protocol) WebSocket endpoint — internal use only
+    router = router.route("/mcp", get(mcp_ws_handler));
+
+    // HTTP proxy with SSRF protection and token-scope enforcement
+    router = router.route("/proxy", post(proxy_handler));
+
+    // Audit log query endpoint — internal, loopback only
+    router = router.route("/audit/recent", get(audit_recent));
+
     #[cfg(feature = "docker")]
     {
         router = router
@@ -1848,6 +1902,67 @@ async fn rotate_token(
     (StatusCode::OK, Json(json!({"rotated": true}))).into_response()
 }
 
+// ── Audit query endpoint ──────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct AuditRecentQuery {
+    #[serde(default = "default_audit_limit")]
+    limit: usize,
+}
+
+fn default_audit_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Serialize)]
+struct AuditRecentEntry {
+    id: i64,
+    event_type: String,
+    payload: serde_json::Value,
+    created_at: i64,
+}
+
+/// `GET /audit/recent?limit=50` — returns recently buffered (including relayed) audit events.
+///
+/// This endpoint is internal and must only be exposed on the loopback interface
+/// (127.0.0.1:8090). It returns events in insertion order, oldest first.
+async fn audit_recent(
+    State(state): State<SharedState>,
+    Query(q): Query<AuditRecentQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.clamp(1, 500);
+    match state.task_store.fetch_unrelayed_events(limit) {
+        Ok(rows) => {
+            let entries: Vec<AuditRecentEntry> = rows
+                .into_iter()
+                .map(|(id, event_type, payload_str, created_at)| {
+                    let payload = serde_json::from_str(&payload_str)
+                        .unwrap_or(serde_json::Value::String(payload_str));
+                    AuditRecentEntry {
+                        id,
+                        event_type,
+                        payload,
+                        created_at,
+                    }
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(entries).unwrap_or(serde_json::Value::Array(vec![]))),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "failed to fetch audit events");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to fetch audit events"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 pub async fn serve(config: Config, port: u16, with_ui: bool) -> Result<()> {
     let cfg = Arc::new(config);
     let state = Arc::new(AppState::new(cfg, with_ui, Some(port)));
@@ -1914,6 +2029,9 @@ pub async fn serve(config: Config, port: u16, with_ui: bool) -> Result<()> {
         state.metrics_tx.clone(),
         state.metrics_webhook.clone(),
     );
+
+    // Spawn audit relay to periodically forward buffered events to Stacker.
+    crate::comms::stacker_relay::spawn_audit_relay(state.task_store.clone());
 
     let app = create_router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
 

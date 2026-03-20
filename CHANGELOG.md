@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased — HTTP Proxy with SSRF Protection and Scope Enforcement
+### Added — `proxy` module
+
+- **`POST /proxy`** — HTTP proxy endpoint at `http://127.0.0.1:8090/proxy`.
+  - AI agents submit requests through the broker instead of calling external APIs directly.
+  - Request body: `{ "method", "url", "headers"?, "body"? }`.
+  - Response: `{ "status", "headers", "body" }` on success; `{"error": "..."}` with appropriate HTTP status on failure.
+- **SSRF hardcoded denylist** (cannot be overridden by token scopes):
+  - Blocks `169.254.169.254` (AWS EC2 metadata) and `fd00:ec2::254` (IPv6 metadata).
+  - Blocks RFC 1918 ranges: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`.
+  - Blocks loopback: `127.0.0.0/8`, `localhost`, `::1`.
+  - Blocks unspecified: `0.0.0.0`, `::`.
+  - Resolves hostnames via `tokio::net::lookup_host` and checks every returned IP.
+- **Token scope enforcement**: URL must match at least one `http_allow` glob pattern and must not match any `http_deny` pattern from the verified task token.
+- **Method allowlist**: Only `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD` are accepted.
+- **Error responses**: `401` (missing/invalid token), `403` (SSRF/scope blocked), `400` (bad method/URL), `502` (upstream failure).
+- **`AppState`** updated with `http_client: reqwest::Client` — shared client with 30-second timeout, created once at startup.
+- **`TaskStore`** — added manual `Debug` impl (required by `#[derive(Debug)]` on `AppState`).
+- **`url = "2"`** added to `Cargo.toml` for URL parsing in SSRF checks.
+- **14 unit tests** in `proxy::tests`:
+  - `test_is_private_ip_ranges` — covers all private/reserved IPv4 and IPv6 ranges.
+  - `test_ssrf_block_metadata_ip`, `test_ssrf_block_localhost`, `test_ssrf_block_private_range` — async SSRF checks for IP literals.
+  - `test_ssrf_block_localhost_hostname`, `test_ssrf_block_ipv6_loopback`, `test_ssrf_block_ipv6_metadata` — name and IPv6 SSRF checks.
+  - `test_allow_list_check`, `test_deny_list_check` — glob matching for scope enforcement.
+  - `test_invalid_method` — `TRACE`/`CONNECT`/`OPTIONS` rejected, allowed methods pass.
+  - `test_glob_match_double_star`, `test_glob_match_exact` — glob pattern correctness.
+
+## Unreleased — MCP WebSocket Server (Agent Broker)
+### Added — `mcp` module (sp-mcp-server)
+
+- **`GET /mcp`** — WebSocket endpoint (JSON-RPC 2.0) exposed at `ws://127.0.0.1:8090/mcp`.
+  - Internal Docker network only; authentication is per-request via task tokens (no separate handshake needed).
+- **`mcp::types`** — `JsonRpcRequest`, `JsonRpcResponse`, `JsonRpcError` structs + standard error codes (`ERR_PARSE`, `ERR_INVALID_REQUEST`, `ERR_METHOD_NOT_FOUND`, `ERR_INVALID_PARAMS`, `ERR_APPLICATION`).
+- **`mcp::tools`** — five MCP tool implementations:
+  - `task/delegate` — mints a child task token (attenuated scopes, enforced depth limit) via `token::delegate`.
+  - `task/info` — returns task metadata (id, depth, scopes, expiry, status) for a verified token.
+  - `task/revoke` — cascading revocation of a task and its descendants; caller must be the direct parent.
+  - `policy/get` — returns the live `StackPolicy` from `AppState::policy_engine`.
+  - `ssh/request_cert` — stub returning `{status: "not_implemented"}` (Vault SSH coming in sp-vault-ssh).
+- **`AppState`** updated with two new fields:
+  - `task_store: Arc<TaskStore>` — opened from `TASK_DB_PATH` env var (default `/var/lib/status-panel/tasks.db`).
+  - `broker_secret: Vec<u8>` — raw bytes of `BROKER_SECRET` env var; used for HMAC token signing.
+- **`AppState::new_with_task_store()`** — test-only constructor for injecting an in-memory store.
+- **11 unit tests** in `mcp::tests`: JSON-RPC parse, method-not-found, invalid version, parse error, `task/info` happy-path and error paths, `task/delegate` depth-limit and success, `task/revoke` non-parent rejection, `ssh/request_cert` stub.
+
 ## Unreleased — Structured Policy Engine (Agent Broker)
 ### Changed / Added — `security::scopes` module
 
