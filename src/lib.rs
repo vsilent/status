@@ -4,6 +4,7 @@ pub mod comms;
 pub mod connectors;
 pub mod monitoring;
 pub mod security;
+pub mod task;
 pub mod transport;
 pub mod utils;
 

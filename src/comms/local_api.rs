@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tera::Tera;
 use tokio::sync::{broadcast, Mutex, Notify};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::agent::backup::BackupSigner;
 use crate::agent::config::Config;
@@ -53,7 +53,7 @@ use crate::security::auth::{Credentials, SessionStore, SessionUser};
 use crate::security::rate_limit::RateLimiter;
 use crate::security::replay::ReplayProtection;
 use crate::security::request_signer::verify_signature;
-use crate::security::scopes::Scopes;
+use crate::security::scopes::{PolicyEngine, Scopes};
 use crate::security::token_cache::TokenCache;
 use crate::security::token_refresh::spawn_token_refresh;
 use crate::security::vault_client::VaultClient;
@@ -123,6 +123,9 @@ pub struct AppState {
     pub token_cache: Option<TokenCache>,
     pub update_jobs: UpdateJobs,
     pub firewall_policy: FirewallPolicy,
+    /// Structured stack policy engine, loaded from Stacker and refreshed every 5 minutes.
+    /// `None` when `STACKER_URL` / `STACK_CODE` are not configured.
+    pub policy_engine: Arc<tokio::sync::RwLock<Option<PolicyEngine>>>,
 }
 
 impl AppState {
@@ -186,6 +189,7 @@ impl AppState {
             token_cache,
             update_jobs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             firewall_policy,
+            policy_engine: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 }
@@ -1847,6 +1851,43 @@ async fn rotate_token(
 pub async fn serve(config: Config, port: u16, with_ui: bool) -> Result<()> {
     let cfg = Arc::new(config);
     let state = Arc::new(AppState::new(cfg, with_ui, Some(port)));
+
+    // Load structured stack policy from Stacker if configured.
+    if let (Ok(stacker_url), Ok(stack_code)) =
+        (std::env::var("STACKER_URL"), std::env::var("STACK_CODE"))
+    {
+        let installation_hash =
+            std::env::var("INSTALLATION_HASH").unwrap_or_else(|_| "default".to_string());
+        match PolicyEngine::load(&stack_code, &stacker_url, &installation_hash).await {
+            Ok(engine) => {
+                *state.policy_engine.write().await = Some(engine);
+                info!("Stack policy engine loaded for stack '{}'", stack_code);
+            }
+            Err(e) => {
+                warn!("Could not load stack policy from Stacker: {}", e);
+            }
+        }
+    } else {
+        info!("STACKER_URL / STACK_CODE not set — policy engine disabled");
+    }
+
+    // Spawn background task to refresh policy every 5 minutes.
+    {
+        let policy_engine_ref = state.policy_engine.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                interval.tick().await;
+                let mut guard = policy_engine_ref.write().await;
+                if let Some(ref mut engine) = *guard {
+                    if let Err(e) = engine.refresh().await {
+                        warn!("Policy refresh failed: {}", e);
+                    }
+                }
+            }
+        });
+    }
 
     // Spawn token refresh task if Vault is configured
     if let (Some(vault_client), Some(token_cache)) = (&state.vault_client, &state.token_cache) {

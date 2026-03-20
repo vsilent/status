@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — Task Token Engine (Agent Broker)
+### Added — `task::token` module (sp-task-token)
+
+- `src/task/token.rs` — full HMAC-SHA256 task token engine:
+  - `TaskTokenClaims` — signed payload struct (task_id, installation_id, parent_id, scopes, depth, epoch, iat, exp).
+  - `mint(record, secret)` — serializes claims to JSON, base64url-encodes, appends HMAC-SHA256 signature. Format: `<base64url(payload)>.<base64url(sig)>`.
+  - `verify(token, secret, store, now)` — decodes token, verifies signature with `subtle::ConstantTimeEq`, checks expiry, loads live DB record, validates epoch matches (revocation detection).
+  - `delegate(parent_token, requested_scopes, installation_id, ttl_secs, secret, store, now)` — verifies parent, enforces depth limit, attenuates scopes, persists child task via `store.insert_child`, mints and returns child token.
+  - `sign(secret, payload)` internal helper using `hmac`+`sha2` crates.
+- `src/task/store.rs` — added `PartialEq` derive to `TaskScopes` (required by token tests).
+- 6 unit tests: roundtrip, wrong-secret rejection, expiry, revocation epoch mismatch, depth limit, scope attenuation.
+
+### Fixed — Stacker JWT signature verification (`stacker/src/connectors/admin_service/jwt.rs`)
+
+- `parse_jwt_claims` now reads `JWT_SECRET` from environment and verifies the HMAC-SHA256 signature before accepting any token.
+- Added `parse_jwt_claims_with_secret(token, secret)` internal helper for testability.
+- Updated unit tests: `create_signed_jwt` helper generates properly signed tokens; added `test_wrong_secret_fails` and `test_tampered_payload_fails` tests.
+
+## Unreleased — Task Store (Agent Broker Foundation)
+### Added — `task::store` module (sp-task-store)
+
+- New `rusqlite` (bundled) and `ulid` crate dependencies.
+- `src/task/mod.rs` — module root exposing `store` and `token` (placeholder).
+- `src/task/store.rs` — `TaskStore` backed by a local SQLite file (`agent_tasks.db` or `$TASK_DB_PATH`):
+  - `agent_task` table with indexes on `parent_id` and `installation_id`, created on first open.
+  - `TaskScopes` (serde Serialize/Deserialize) — SSH targets, HTTP allow/deny, TryDirect ops, sub-agent limits.
+  - `TaskRecord` — in-memory representation of a task row.
+  - `TaskStore::insert_root` — creates a depth-0 task with a ULID task ID.
+  - `TaskStore::insert_child` — creates a child task with attenuated scopes; rejects if depth would exceed `max_depth`.
+  - `TaskStore::get_by_id` — fetch a single task.
+  - `TaskStore::revoke_cascade` — sets status to `revoked` and increments epoch for a task and all its descendants (recursive CTE).
+  - `TaskStore::get_active_count` — counts active tasks per installation.
+  - `attenuate(parent, requested)` free function — computes intersection/union/min across scope fields.
+- 6 unit tests covering root creation, child insertion, scope attenuation, cascade revoke, depth limit enforcement, and active count.
+
+- `tests/task_store_integration.rs` — 22 integration tests covering:
+  - Schema idempotency (opening the same DB twice)
+  - Root task defaults and round-trip retrieval
+  - Child task TTL, epoch/depth inheritance
+  - Scope attenuation (ssh_targets, http_allow/deny, trydirect_ops, limits)
+  - Depth limit enforcement (at-limit succeeds, beyond-limit rejected)
+  - Cascade revoke (full subtree, leaf-only, non-existent ID)
+  - Active count scoped per installation
+  - Thread safety (8 concurrent child inserts via `Arc<TaskStore>`)
+  - `attenuate()` edge cases (empty parent, deny-list deduplication)
+
 ## 0.1.4 — 2026-03-13
 ### Added — CLI Improvements, Install Script & GitHub Releases
 

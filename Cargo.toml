@@ -38,6 +38,8 @@ sysinfo = "0.30"
 # Docker client for Rust (SSL disabled to avoid OpenSSL dependency on musl)
 # The "pipe" feature enables Unix socket support via hyperlocal
 bollard = { version = "0.19", optional = true, default-features = false, features = ["chrono", "pipe"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+ulid = "1"
 # Daemonization
 daemonize = "0.5"
 # Load environment variables from .env
