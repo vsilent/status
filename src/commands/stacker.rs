@@ -4,9 +4,9 @@ use chrono::{SecondsFormat, Utc};
 #[cfg(feature = "docker")]
 use regex::Regex;
 use serde::Deserialize;
+use serde::Serialize;
 #[cfg(any(feature = "docker", test))]
 use serde_json::json;
-#[cfg(any(feature = "docker", test))]
 use serde_json::Value;
 #[cfg(feature = "docker")]
 use std::collections::{HashMap, HashSet};
@@ -24,6 +24,240 @@ use super::firewall::{self, ConfigureFirewallCommand};
 
 const LOGS_DEFAULT_LIMIT: usize = 400;
 const LOGS_MAX_LIMIT: usize = 1000;
+
+/// Container runtime selection for hardware-level isolation.
+/// Defaults to `Runc` (standard Linux containers). `Kata` provides microVM-based isolation
+/// via Kata Containers, giving each workload its own lightweight VM with a dedicated kernel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerRuntime {
+    #[default]
+    Runc,
+    Kata,
+}
+
+#[cfg(all(test, feature = "docker"))]
+mod trigger_pipe_handler_tests {
+    use super::*;
+    use mockito::{Matcher, Server};
+
+    fn make_trigger_agent_command() -> AgentCommand {
+        AgentCommand {
+            id: "cmd-trigger".into(),
+            command_id: "cmd-trigger".into(),
+            name: "trigger_pipe".into(),
+            params: json!({}),
+            deployment_hash: Some("dep-123".into()),
+            app_code: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_trigger_pipe_posts_mapped_payload_to_external_target() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/webhook/pipe")
+            .match_body(Matcher::Exact(r#"{"email":"dev@try.direct"}"#.into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"accepted":true}"#)
+            .create_async()
+            .await;
+
+        let agent_cmd = make_trigger_agent_command();
+        let data = TriggerPipeCommand {
+            deployment_hash: "dep-123".into(),
+            pipe_instance_id: "11111111-1111-1111-1111-111111111111".into(),
+            input_data: Some(json!({ "user": { "email": "dev@try.direct" } })),
+            source_container: None,
+            source_endpoint: "/".into(),
+            source_method: "GET".into(),
+            target_url: Some(server.url()),
+            target_container: None,
+            target_endpoint: "/webhook/pipe".into(),
+            target_method: "POST".into(),
+            field_mapping: Some(json!({ "email": "$.user.email" })),
+            trigger_type: "manual".into(),
+        };
+
+        let result = handle_trigger_pipe(&agent_cmd, &data)
+            .await
+            .expect("trigger_pipe should execute");
+
+        mock.assert_async().await;
+        assert_eq!(result.status, "completed");
+        assert!(result.error.is_none());
+
+        let body = result.result.expect("trigger_pipe result body");
+        assert_eq!(body["success"], true);
+        assert_eq!(body["mapped_data"], json!({ "email": "dev@try.direct" }));
+        assert_eq!(body["target_response"]["status"], 200);
+        assert_eq!(body["target_response"]["body"], json!({ "accepted": true }));
+    }
+
+    #[tokio::test]
+    async fn handle_trigger_pipe_requires_external_target_url() {
+        let agent_cmd = make_trigger_agent_command();
+        let data = TriggerPipeCommand {
+            deployment_hash: "dep-123".into(),
+            pipe_instance_id: "11111111-1111-1111-1111-111111111111".into(),
+            input_data: Some(json!({ "user": { "email": "dev@try.direct" } })),
+            source_container: None,
+            source_endpoint: "/".into(),
+            source_method: "GET".into(),
+            target_url: None,
+            target_container: None,
+            target_endpoint: "/webhook/pipe".into(),
+            target_method: "POST".into(),
+            field_mapping: Some(json!({ "email": "$.user.email" })),
+            trigger_type: "manual".into(),
+        };
+
+        let result = handle_trigger_pipe(&agent_cmd, &data)
+            .await
+            .expect("trigger_pipe should return structured failure");
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(
+            result.error.as_deref(),
+            Some("trigger_pipe requires target_url or target_container")
+        );
+    }
+
+    #[test]
+    fn build_trigger_pipe_container_command_posts_json_payload() {
+        let command = build_trigger_pipe_container_command(
+            "/webhook/pipe",
+            "POST",
+            &json!({ "email": "dev@try.direct", "name": "O'Reilly" }),
+        );
+
+        assert!(command.contains("curl -sS -X POST"));
+        assert!(command.contains("http://127.0.0.1/webhook/pipe"));
+        assert!(command.contains("\"email\":\"dev@try.direct\""));
+        assert!(!command.contains("\"name\":\"O'Reilly\""));
+        assert!(command.contains("Reilly"));
+        assert!(command.contains("%{http_code}"));
+    }
+
+    #[test]
+    fn build_trigger_pipe_source_command_fetches_json_payload() {
+        let command = build_trigger_pipe_source_command("/source/data", "get");
+
+        assert!(command.contains("curl -sS -X GET"));
+        assert!(command.contains("http://127.0.0.1/source/data"));
+        assert!(command.contains("%{http_code}"));
+    }
+
+    #[tokio::test]
+    async fn handle_trigger_pipe_requires_input_or_source_details() {
+        let agent_cmd = make_trigger_agent_command();
+        let data = TriggerPipeCommand {
+            deployment_hash: "dep-123".into(),
+            pipe_instance_id: "11111111-1111-1111-1111-111111111111".into(),
+            input_data: None,
+            source_container: None,
+            source_endpoint: "/source/data".into(),
+            source_method: "GET".into(),
+            target_url: None,
+            target_container: Some("target-app".into()),
+            target_endpoint: "/webhook/pipe".into(),
+            target_method: "POST".into(),
+            field_mapping: Some(json!({ "email": "$.user.email" })),
+            trigger_type: "manual".into(),
+        };
+
+        let result = handle_trigger_pipe(&agent_cmd, &data)
+            .await
+            .expect("trigger_pipe should return structured failure");
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(
+            result.error.as_deref(),
+            Some("trigger_pipe requires input_data or source_container")
+        );
+    }
+}
+
+impl std::fmt::Display for ContainerRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ContainerRuntime::Runc => write!(f, "runc"),
+            ContainerRuntime::Kata => write!(f, "kata"),
+        }
+    }
+}
+
+impl ContainerRuntime {
+    /// Returns the Docker runtime identifier string for compose YAML injection.
+    pub fn docker_runtime_name(&self) -> &'static str {
+        match self {
+            ContainerRuntime::Runc => "runc",
+            ContainerRuntime::Kata => "io.containerd.kata.v2",
+        }
+    }
+}
+
+/// Detect whether the Kata Containers runtime is available on this host.
+/// Checks `docker info` output for a registered kata runtime.
+/// Result is cached for the lifetime of the process via `OnceLock`.
+#[cfg(feature = "docker")]
+pub async fn detect_kata_runtime() -> bool {
+    use std::sync::OnceLock;
+    use tokio::process::Command;
+
+    static KATA_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+    if let Some(&cached) = KATA_AVAILABLE.get() {
+        return cached;
+    }
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let output = Command::new("docker")
+            .args(["info", "--format", "{{json .Runtimes}}"])
+            .output()
+            .await;
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let lower = stdout.to_lowercase();
+                lower.contains("kata") || lower.contains("io.containerd.kata")
+            }
+            _ => false,
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    let _ = KATA_AVAILABLE.set(result);
+    result
+}
+
+/// Inject a `runtime` field into every service definition of a docker-compose YAML string.
+/// Returns the modified YAML. If parsing fails, returns the original content unchanged.
+#[cfg(feature = "docker")]
+pub fn inject_runtime_into_compose(compose_content: &str, runtime: &ContainerRuntime) -> String {
+    let mut doc: serde_yaml::Value = match serde_yaml::from_str(compose_content) {
+        Ok(v) => v,
+        Err(_) => return compose_content.to_string(),
+    };
+
+    let runtime_name = runtime.docker_runtime_name();
+
+    if let Some(services) = doc.get_mut("services").and_then(|s| s.as_mapping_mut()) {
+        for (_name, service_def) in services.iter_mut() {
+            if let Some(mapping) = service_def.as_mapping_mut() {
+                mapping.insert(
+                    serde_yaml::Value::String("runtime".into()),
+                    serde_yaml::Value::String(runtime_name.into()),
+                );
+            }
+        }
+    }
+
+    serde_yaml::to_string(&doc).unwrap_or_else(|_| compose_content.to_string())
+}
 
 #[derive(Debug, Clone)]
 pub enum StackerCommand {
@@ -46,6 +280,7 @@ pub enum StackerCommand {
     ListContainers(ListContainersCommand),
     ConfigureFirewall(ConfigureFirewallCommand),
     ProbeEndpoints(ProbeEndpointsCommand),
+    TriggerPipe(TriggerPipeCommand),
 }
 
 #[cfg_attr(not(feature = "docker"), allow(dead_code))]
@@ -132,6 +367,54 @@ pub struct ErrorSummaryCommand {
     redact: bool,
 }
 
+#[cfg_attr(not(feature = "docker"), allow(dead_code))]
+#[derive(Debug, Clone, Deserialize)]
+pub struct TriggerPipeCommand {
+    #[serde(default)]
+    deployment_hash: String,
+    pipe_instance_id: String,
+    #[serde(default)]
+    input_data: Option<Value>,
+    #[serde(default)]
+    source_container: Option<String>,
+    #[serde(default = "default_pipe_source_endpoint")]
+    source_endpoint: String,
+    #[serde(default = "default_pipe_source_method")]
+    source_method: String,
+    #[serde(default)]
+    target_url: Option<String>,
+    #[serde(default)]
+    target_container: Option<String>,
+    #[serde(default = "default_pipe_target_endpoint")]
+    target_endpoint: String,
+    #[serde(default = "default_pipe_target_method")]
+    target_method: String,
+    #[serde(default)]
+    field_mapping: Option<Value>,
+    #[serde(default = "default_pipe_trigger_type")]
+    trigger_type: String,
+}
+
+fn default_pipe_source_endpoint() -> String {
+    "/".to_string()
+}
+
+fn default_pipe_source_method() -> String {
+    "GET".to_string()
+}
+
+fn default_pipe_target_endpoint() -> String {
+    "/".to_string()
+}
+
+fn default_pipe_target_method() -> String {
+    "POST".to_string()
+}
+
+fn default_pipe_trigger_type() -> String {
+    "manual".to_string()
+}
+
 /// Command to fetch app configuration from Vault
 #[cfg_attr(not(feature = "docker"), allow(dead_code))]
 #[derive(Debug, Clone, Deserialize)]
@@ -191,6 +474,9 @@ pub struct DeployAppCommand {
     /// Optional: config files to write before deploying (uses existing AppConfig struct)
     #[serde(default)]
     config_files: Option<Vec<crate::security::vault_client::AppConfig>>,
+    /// Container runtime to use: "runc" (default) or "kata" for microVM isolation
+    #[serde(default)]
+    runtime: Option<ContainerRuntime>,
 }
 
 /// Command to remove an app container and associated config
@@ -243,6 +529,9 @@ pub struct DeployWithConfigsCommand {
     /// Whether to apply all project configs before deploying
     #[serde(default = "default_true")]
     apply_configs: bool,
+    /// Container runtime to use: "runc" (default) or "kata" for microVM isolation
+    #[serde(default)]
+    runtime: Option<ContainerRuntime>,
 }
 
 /// Command to detect configuration drift between Vault and deployed files
@@ -385,6 +674,9 @@ pub struct ProbeEndpointsCommand {
     /// Timeout per probe request in seconds
     #[serde(default = "default_probe_timeout")]
     probe_timeout: u32,
+    /// Whether to capture sample responses from discovered endpoints
+    #[serde(default)]
+    capture_samples: bool,
 }
 
 fn default_probe_protocols() -> Vec<String> {
@@ -546,6 +838,13 @@ pub fn parse_stacker_command(cmd: &AgentCommand) -> Result<Option<StackerCommand
             let payload = payload.normalize().with_command_context(cmd);
             payload.validate()?;
             Ok(Some(StackerCommand::ProbeEndpoints(payload)))
+        }
+        "trigger_pipe" | "stacker.trigger_pipe" => {
+            let payload: TriggerPipeCommand = serde_json::from_value(unwrap_params(&cmd.params))
+                .context("invalid trigger_pipe payload")?;
+            let payload = payload.normalize().with_command_context(cmd);
+            payload.validate()?;
+            Ok(Some(StackerCommand::TriggerPipe(payload)))
         }
         _ => Ok(None),
     }
@@ -850,6 +1149,56 @@ impl ErrorSummaryCommand {
             bail!("deployment_hash is required");
         }
         // app_code is optional for error_summary - if empty, analyze all containers
+        Ok(())
+    }
+}
+
+impl TriggerPipeCommand {
+    fn normalize(mut self) -> Self {
+        self.deployment_hash = trimmed(&self.deployment_hash);
+        self.pipe_instance_id = trimmed(&self.pipe_instance_id);
+        self.source_container = self.source_container.map(|value| trimmed(&value));
+        self.source_endpoint = trimmed(&self.source_endpoint);
+        if self.source_endpoint.is_empty() {
+            self.source_endpoint = default_pipe_source_endpoint();
+        }
+        self.source_method = trimmed(&self.source_method).to_uppercase();
+        if self.source_method.is_empty() {
+            self.source_method = default_pipe_source_method();
+        }
+        self.target_url = self.target_url.map(|value| trimmed(&value));
+        self.target_container = self.target_container.map(|value| trimmed(&value));
+        self.target_endpoint = trimmed(&self.target_endpoint);
+        if self.target_endpoint.is_empty() {
+            self.target_endpoint = "/".to_string();
+        }
+        self.target_method = trimmed(&self.target_method).to_uppercase();
+        if self.target_method.is_empty() {
+            self.target_method = default_pipe_target_method();
+        }
+        self.trigger_type = trimmed(&self.trigger_type).to_lowercase();
+        if self.trigger_type.is_empty() {
+            self.trigger_type = default_pipe_trigger_type();
+        }
+        self
+    }
+
+    fn with_command_context(mut self, agent_cmd: &AgentCommand) -> Self {
+        if self.deployment_hash.is_empty() {
+            if let Some(hash) = &agent_cmd.deployment_hash {
+                self.deployment_hash = hash.clone();
+            }
+        }
+        self
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.deployment_hash.is_empty() {
+            bail!("deployment_hash is required");
+        }
+        if self.pipe_instance_id.is_empty() {
+            bail!("pipe_instance_id is required");
+        }
         Ok(())
     }
 }
@@ -1443,10 +1792,398 @@ async fn execute_with_docker(
         StackerCommand::ServerResources(data) => handle_server_resources(agent_cmd, data).await,
         StackerCommand::ListContainers(data) => handle_list_containers(agent_cmd, data).await,
         StackerCommand::ProbeEndpoints(data) => handle_probe_endpoints(agent_cmd, data).await,
+        StackerCommand::TriggerPipe(data) => handle_trigger_pipe(agent_cmd, data).await,
         StackerCommand::ConfigureFirewall(data) => {
             firewall::handle_configure_firewall(agent_cmd, data, firewall_policy).await
         }
     }
+}
+
+#[cfg(feature = "docker")]
+fn extract_json_path_value(source: &Value, path: &str) -> Value {
+    let trimmed = path.trim();
+    if !trimmed.starts_with("$.") {
+        return Value::Null;
+    }
+
+    let mut current = source;
+    for segment in trimmed.trim_start_matches("$.").split('.') {
+        if segment.is_empty() {
+            continue;
+        }
+        match current {
+            Value::Object(map) => match map.get(segment) {
+                Some(value) => current = value,
+                None => return Value::Null,
+            },
+            _ => return Value::Null,
+        }
+    }
+
+    current.clone()
+}
+
+#[cfg(feature = "docker")]
+fn apply_pipe_field_mapping(source: &Value, field_mapping: Option<&Value>) -> Value {
+    let Some(Value::Object(mapping)) = field_mapping else {
+        return source.clone();
+    };
+
+    if mapping.is_empty() {
+        return source.clone();
+    }
+
+    let mut mapped = serde_json::Map::new();
+    for (key, rule) in mapping {
+        let value = match rule {
+            Value::String(path) if path.starts_with("$.") => extract_json_path_value(source, path),
+            other => other.clone(),
+        };
+        mapped.insert(key.clone(), value);
+    }
+    Value::Object(mapped)
+}
+
+#[cfg(feature = "docker")]
+fn build_pipe_target_url(base: &str, endpoint: &str) -> String {
+    let trimmed_base = base.trim_end_matches('/');
+    let trimmed_endpoint = endpoint.trim();
+    if trimmed_endpoint.is_empty() || trimmed_endpoint == "/" {
+        return format!("{}/", trimmed_base);
+    }
+    format!(
+        "{}/{}",
+        trimmed_base,
+        trimmed_endpoint.trim_start_matches('/')
+    )
+}
+
+#[cfg(feature = "docker")]
+fn shell_escape_single_quotes(value: &str) -> String {
+    value.replace('\'', r#"'\"'\"'"#)
+}
+
+#[cfg(feature = "docker")]
+fn build_trigger_pipe_container_command(endpoint: &str, method: &str, payload: &Value) -> String {
+    let json_payload = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
+    let escaped_payload = shell_escape_single_quotes(&json_payload);
+    let url = build_pipe_target_url("http://127.0.0.1", endpoint);
+    format!(
+        "curl -sS -X {} -H 'Content-Type: application/json' --data-raw '{}' -w '\\n%{{http_code}}' {}",
+        method, escaped_payload, url
+    )
+}
+
+#[cfg(feature = "docker")]
+fn build_trigger_pipe_source_command(endpoint: &str, method: &str) -> String {
+    let url = build_pipe_target_url("http://127.0.0.1", endpoint);
+    format!(
+        "curl -sS -X {} -w '\\n%{{http_code}}' {}",
+        method.to_uppercase(),
+        url
+    )
+}
+
+#[cfg(feature = "docker")]
+async fn send_trigger_pipe_request(
+    url: &str,
+    method: &str,
+    payload: &Value,
+) -> Result<(u16, Value)> {
+    let method = reqwest::Method::from_bytes(method.as_bytes())
+        .with_context(|| format!("invalid target_method '{}'", method))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("building trigger_pipe http client")?;
+
+    let response = client
+        .request(method, url)
+        .json(payload)
+        .send()
+        .await
+        .with_context(|| format!("sending trigger_pipe request to {}", url))?;
+
+    let status = response.status().as_u16();
+    let body_text = response
+        .text()
+        .await
+        .context("reading trigger_pipe response body")?;
+    let body = if body_text.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&body_text).unwrap_or(Value::String(body_text))
+    };
+
+    Ok((status, body))
+}
+
+#[cfg(feature = "docker")]
+async fn fetch_trigger_pipe_source_request(
+    container: &str,
+    endpoint: &str,
+    method: &str,
+) -> Result<(u16, Value)> {
+    let command = build_trigger_pipe_source_command(endpoint, method);
+    let (exit_code, stdout, stderr) = docker::exec_in_container_with_output(container, &command)
+        .await
+        .with_context(|| {
+            format!(
+                "fetching trigger_pipe source inside container {}",
+                container
+            )
+        })?;
+
+    if exit_code != 0 {
+        bail!(
+            "source container request failed with code {}: {}",
+            exit_code,
+            stderr.trim()
+        );
+    }
+
+    let mut lines = stdout.lines().collect::<Vec<_>>();
+    let status_line = lines.pop().unwrap_or("000").trim();
+    let status = status_line.parse::<u16>().unwrap_or(0);
+    let body_text = lines.join("\n");
+    let body = if body_text.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&body_text).unwrap_or(Value::String(body_text))
+    };
+
+    Ok((status, body))
+}
+
+#[cfg(feature = "docker")]
+async fn send_trigger_pipe_container_request(
+    container: &str,
+    endpoint: &str,
+    method: &str,
+    payload: &Value,
+) -> Result<(u16, Value)> {
+    let command = build_trigger_pipe_container_command(endpoint, method, payload);
+    let (exit_code, stdout, stderr) = docker::exec_in_container_with_output(container, &command)
+        .await
+        .with_context(|| {
+            format!(
+                "sending trigger_pipe request inside container {}",
+                container
+            )
+        })?;
+
+    if exit_code != 0 {
+        bail!(
+            "target container request failed with code {}: {}",
+            exit_code,
+            stderr.trim()
+        );
+    }
+
+    let mut lines = stdout.lines().collect::<Vec<_>>();
+    let status_line = lines.pop().unwrap_or("000").trim();
+    let status = status_line.parse::<u16>().unwrap_or(0);
+    let body_text = lines.join("\n");
+    let body = if body_text.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&body_text).unwrap_or(Value::String(body_text))
+    };
+
+    Ok((status, body))
+}
+
+#[cfg(feature = "docker")]
+async fn handle_trigger_pipe(
+    agent_cmd: &AgentCommand,
+    data: &TriggerPipeCommand,
+) -> Result<CommandResult> {
+    let mut result = base_result(agent_cmd, &data.deployment_hash, "", "trigger_pipe");
+    let source_data = match data.input_data.clone() {
+        Some(value) => value,
+        None => match data
+            .source_container
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            Some(container) => match fetch_trigger_pipe_source_request(
+                container,
+                &data.source_endpoint,
+                &data.source_method,
+            )
+            .await
+            {
+                Ok((status_code, response_body)) if (200..300).contains(&status_code) => {
+                    response_body
+                }
+                Ok((status_code, response_body)) => {
+                    let error = format!("source fetch failed with status {}", status_code);
+                    result.status = "failed".into();
+                    result.result = Some(json!({
+                        "type": "trigger_pipe",
+                        "deployment_hash": data.deployment_hash,
+                        "pipe_instance_id": data.pipe_instance_id,
+                        "success": false,
+                        "source_data": response_body,
+                        "mapped_data": Value::Null,
+                        "target_response": Value::Null,
+                        "error": error,
+                        "triggered_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                        "trigger_type": data.trigger_type,
+                    }));
+                    result.error = Some(error);
+                    return Ok(result);
+                }
+                Err(err) => {
+                    let error = format!("failed to fetch trigger_pipe source: {}", err);
+                    result.status = "failed".into();
+                    result.result = Some(json!({
+                        "type": "trigger_pipe",
+                        "deployment_hash": data.deployment_hash,
+                        "pipe_instance_id": data.pipe_instance_id,
+                        "success": false,
+                        "source_data": Value::Null,
+                        "mapped_data": Value::Null,
+                        "target_response": Value::Null,
+                        "error": error,
+                        "triggered_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                        "trigger_type": data.trigger_type,
+                    }));
+                    result.error = Some(error);
+                    return Ok(result);
+                }
+            },
+            None => {
+                let error = "trigger_pipe requires input_data or source_container";
+                result.status = "failed".into();
+                result.result = Some(json!({
+                    "type": "trigger_pipe",
+                    "deployment_hash": data.deployment_hash,
+                    "pipe_instance_id": data.pipe_instance_id,
+                    "success": false,
+                    "source_data": Value::Null,
+                    "mapped_data": Value::Null,
+                    "target_response": Value::Null,
+                    "error": error,
+                    "triggered_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                    "trigger_type": data.trigger_type,
+                }));
+                result.error = Some(error.into());
+                return Ok(result);
+            }
+        },
+    };
+
+    let mapped_data = apply_pipe_field_mapping(&source_data, data.field_mapping.as_ref());
+    let target = match (
+        data.target_url.as_deref().filter(|value| !value.is_empty()),
+        data.target_container
+            .as_deref()
+            .filter(|value| !value.is_empty()),
+    ) {
+        (Some(value), _) => Ok((
+            "external",
+            build_pipe_target_url(value, &data.target_endpoint),
+        )),
+        (None, Some(value)) => Ok(("container", value.to_string())),
+        (None, None) => {
+            let error = "trigger_pipe requires target_url or target_container";
+            result.status = "failed".into();
+            result.result = Some(json!({
+                "type": "trigger_pipe",
+                "deployment_hash": data.deployment_hash,
+                "pipe_instance_id": data.pipe_instance_id,
+                "success": false,
+                "source_data": source_data,
+                "mapped_data": mapped_data,
+                "target_response": Value::Null,
+                "error": error,
+                "triggered_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "trigger_type": data.trigger_type,
+            }));
+            result.error = Some(error.into());
+            Err(())
+        }
+    };
+    if target.is_err() {
+        return Ok(result);
+    }
+    let (target_mode, target_value) = target.unwrap();
+
+    let send_result = match target_mode {
+        "external" => {
+            send_trigger_pipe_request(&target_value, &data.target_method, &mapped_data).await
+        }
+        "container" => {
+            send_trigger_pipe_container_request(
+                &target_value,
+                &data.target_endpoint,
+                &data.target_method,
+                &mapped_data,
+            )
+            .await
+        }
+        _ => unreachable!(),
+    };
+
+    match send_result {
+        Ok((status_code, response_body)) if (200..300).contains(&status_code) => {
+            result.status = "completed".into();
+            result.result = Some(json!({
+                "type": "trigger_pipe",
+                "deployment_hash": data.deployment_hash,
+                "pipe_instance_id": data.pipe_instance_id,
+                "success": true,
+                "source_data": source_data,
+                "mapped_data": mapped_data,
+                "target_response": {
+                    "status": status_code,
+                    "body": response_body,
+                },
+                "triggered_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "trigger_type": data.trigger_type,
+            }));
+        }
+        Ok((status_code, response_body)) => {
+            let error = format!("target request failed with status {}", status_code);
+            result.status = "failed".into();
+            result.result = Some(json!({
+                "type": "trigger_pipe",
+                "deployment_hash": data.deployment_hash,
+                "pipe_instance_id": data.pipe_instance_id,
+                "success": false,
+                "source_data": source_data,
+                "mapped_data": mapped_data,
+                "target_response": {
+                    "status": status_code,
+                    "body": response_body,
+                },
+                "error": error,
+                "triggered_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "trigger_type": data.trigger_type,
+            }));
+            result.error = Some(error);
+        }
+        Err(err) => {
+            let error = err.to_string();
+            result.status = "failed".into();
+            result.result = Some(json!({
+                "type": "trigger_pipe",
+                "deployment_hash": data.deployment_hash,
+                "pipe_instance_id": data.pipe_instance_id,
+                "success": false,
+                "source_data": source_data,
+                "mapped_data": mapped_data,
+                "target_response": Value::Null,
+                "error": error,
+                "triggered_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                "trigger_type": data.trigger_type,
+            }));
+            result.error = Some(error);
+        }
+    }
+
+    Ok(result)
 }
 
 #[cfg(feature = "docker")]
@@ -2575,6 +3312,34 @@ async fn handle_deploy_app(
             "Writing docker-compose.yml from command payload"
         );
 
+        // Inject container runtime (kata/runc) into compose services if requested
+        let final_compose = if let Some(runtime) = &data.runtime {
+            if *runtime == ContainerRuntime::Kata {
+                let kata_available = detect_kata_runtime().await;
+                if kata_available {
+                    tracing::info!(
+                        runtime = %runtime,
+                        "Injecting Kata runtime into compose services"
+                    );
+                    inject_runtime_into_compose(compose_content, runtime)
+                } else {
+                    tracing::warn!(
+                        "Kata runtime requested but not available on this host — falling back to runc"
+                    );
+                    errors.push(make_error(
+                        "kata_fallback",
+                        "Kata runtime requested but not available on this host; deploying with runc",
+                        None,
+                    ));
+                    compose_content.clone()
+                }
+            } else {
+                compose_content.clone()
+            }
+        } else {
+            compose_content.clone()
+        };
+
         // Create the directory if it doesn't exist
         if let Err(e) = tokio::fs::create_dir_all(&compose_dir).await {
             let error = make_error(
@@ -2589,7 +3354,7 @@ async fn handle_deploy_app(
         }
 
         // Write the compose file
-        if let Err(e) = tokio::fs::write(&compose_file, compose_content).await {
+        if let Err(e) = tokio::fs::write(&compose_file, &final_compose).await {
             let error = make_error(
                 "compose_write_failed",
                 format!("Failed to write docker-compose.yml: {}", e),
@@ -2605,6 +3370,55 @@ async fn handle_deploy_app(
             compose_file = %compose_file,
             "docker-compose.yml written successfully"
         );
+    } else if let Some(runtime) = &data.runtime {
+        // Compose content not in payload — modify existing file on disk if runtime is requested
+        if *runtime == ContainerRuntime::Kata {
+            match tokio::fs::try_exists(&compose_file).await {
+                Ok(true) => {
+                    let kata_available = detect_kata_runtime().await;
+                    if kata_available {
+                        if let Ok(existing) = tokio::fs::read_to_string(&compose_file).await {
+                            let injected = inject_runtime_into_compose(&existing, runtime);
+                            if let Err(e) = tokio::fs::write(&compose_file, &injected).await {
+                                errors.push(make_error(
+                                    "runtime_inject_warning",
+                                    format!(
+                                        "Failed to inject Kata runtime into compose file: {}",
+                                        e
+                                    ),
+                                    None,
+                                ));
+                            } else {
+                                tracing::info!(
+                                    compose_file = %compose_file,
+                                    "Injected Kata runtime into existing compose file"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Kata runtime requested but not available on this host — falling back to runc"
+                        );
+                        errors.push(make_error(
+                            "kata_fallback",
+                            "Kata runtime requested but not available on this host; deploying with runc",
+                            None,
+                        ));
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    errors.push(make_error(
+                        "runtime_inject_warning",
+                        format!(
+                            "Failed to check compose file before runtime injection: {}",
+                            e
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
     }
 
     // Write config files if provided (e.g., telegraf.conf, nginx.conf, etc.)
@@ -2916,12 +3730,15 @@ async fn handle_deploy_app(
                     "starting".to_string()
                 };
 
+                let effective_runtime = data.runtime.as_ref().unwrap_or(&ContainerRuntime::Runc);
+
                 let body = json!({
                     "type": "deploy_app",
                     "deployment_hash": data.deployment_hash.clone(),
                     "app_code": data.app_code.clone(),
                     "status": "deployed",
                     "container_state": container_state,
+                    "runtime": effective_runtime.to_string(),
                     "deployed_at": now_timestamp(),
                     "output": stdout.trim(),
                     "warnings": if errors.is_empty() { json!(null) } else { errors_value(&errors) },
@@ -3516,6 +4333,7 @@ async fn handle_deploy_with_configs(
         pull: data.pull,
         force_recreate: data.force_recreate,
         config_files: None, // Configs already written in step 1 from Vault
+        runtime: data.runtime.clone(),
     };
 
     let deploy_result = handle_deploy_app(agent_cmd, &deploy_cmd).await?;
@@ -4273,7 +5091,7 @@ async fn get_container_ports(container_name: &str) -> Result<Vec<u16>> {
 }
 
 #[cfg(any(feature = "docker", test))]
-fn extract_openapi_operations(spec: &Value) -> Vec<Value> {
+fn extract_openapi_operations(spec: &Value, capture_samples: bool) -> Vec<Value> {
     let mut operations = Vec::new();
 
     if let Some(paths) = spec.get("paths").and_then(|p| p.as_object()) {
@@ -4297,18 +5115,88 @@ fn extract_openapi_operations(spec: &Value) -> Vec<Value> {
                     // Extract field names from request body schema
                     let fields = extract_request_fields(spec, details);
 
-                    operations.push(json!({
+                    let mut op = json!({
                         "path": path,
                         "method": method_upper,
                         "summary": summary,
                         "fields": fields,
-                    }));
+                    });
+
+                    // Extract sample response from OpenAPI spec examples
+                    if capture_samples {
+                        if let Some(sample) = extract_response_example(spec, details) {
+                            op["sample_response"] = sample;
+                        }
+                    }
+
+                    operations.push(op);
                 }
             }
         }
     }
 
     operations
+}
+
+/// Extract a sample response from an OpenAPI operation's response schema.
+/// Looks for: responses -> 200 -> content -> application/json -> example/schema/examples
+#[cfg(any(feature = "docker", test))]
+fn extract_response_example(spec: &Value, operation: &Value) -> Option<Value> {
+    let responses = operation.get("responses")?;
+
+    // Try 200, 201, then default
+    let response = responses
+        .get("200")
+        .or_else(|| responses.get("201"))
+        .or_else(|| responses.get("default"))?;
+
+    // OpenAPI 3.x: content -> application/json -> example or schema -> example
+    if let Some(content) = response.get("content") {
+        if let Some(json_content) = content.get("application/json") {
+            // Direct example on the media type
+            if let Some(example) = json_content.get("example") {
+                return Some(example.clone());
+            }
+            // Examples (named) — take the first one
+            if let Some(examples) = json_content.get("examples").and_then(|e| e.as_object()) {
+                if let Some((_, first)) = examples.iter().next() {
+                    if let Some(value) = first.get("value") {
+                        return Some(value.clone());
+                    }
+                }
+            }
+            // Schema example
+            if let Some(schema) = json_content.get("schema") {
+                if let Some(example) = schema.get("example") {
+                    return Some(example.clone());
+                }
+                // Resolve $ref if present
+                if let Some(ref_path) = schema.get("$ref").and_then(|r| r.as_str()) {
+                    if let Some(resolved) = resolve_ref(spec, ref_path) {
+                        if let Some(example) = resolved.get("example") {
+                            return Some(example.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Swagger 2.x: examples -> application/json
+    if let Some(examples) = response.get("examples") {
+        if let Some(json_example) = examples.get("application/json") {
+            return Some(json_example.clone());
+        }
+    }
+
+    // Swagger 2.x: schema -> example
+    if let Some(schema) = response.get("schema") {
+        if let Some(example) = schema.get("example") {
+            return Some(example.clone());
+        }
+    }
+
+    None
 }
 
 #[cfg(any(feature = "docker", test))]
@@ -4508,7 +5396,8 @@ async fn handle_probe_endpoints(
                                 if !protocols_detected.contains(&"openapi".to_string()) {
                                     protocols_detected.push("openapi".to_string());
                                 }
-                                let operations = extract_openapi_operations(&spec);
+                                let operations =
+                                    extract_openapi_operations(&spec, data.capture_samples);
                                 endpoints.push(json!({
                                     "protocol": "openapi",
                                     "base_url": format!("http://{}:{}", data.app_code, port),
@@ -4575,12 +5464,44 @@ async fn handle_probe_endpoints(
                             if !protocols_detected.contains(&"rest".to_string()) {
                                 protocols_detected.push("rest".to_string());
                             }
-                            endpoints.push(json!({
+
+                            // Capture sample response body for REST endpoints
+                            let mut sample_response = None;
+                            if data.capture_samples && code == "200" {
+                                let body_cmd = format!(
+                                    "curl -sf -m {} http://localhost:{}{} 2>/dev/null || true",
+                                    data.probe_timeout, port, path
+                                );
+                                if let Ok(Ok((0, body, _))) = tokio::time::timeout(
+                                    std::time::Duration::from_secs((data.probe_timeout + 2) as u64),
+                                    docker::exec_in_container_with_output(&target_name, &body_cmd),
+                                )
+                                .await
+                                {
+                                    let body = body.trim();
+                                    if !body.is_empty() {
+                                        // Try to parse as JSON; fall back to string
+                                        sample_response = Some(
+                                            serde_json::from_str::<Value>(body)
+                                                .unwrap_or_else(|_| json!(body)),
+                                        );
+                                    }
+                                }
+                            }
+
+                            let mut ep = json!({
                                 "protocol": "rest",
                                 "base_url": format!("http://{}:{}", data.app_code, port),
                                 "spec_url": path,
                                 "operations": [],
-                            }));
+                            });
+
+                            // Attach sample_response at endpoint level for REST heuristic
+                            if let Some(sample) = sample_response {
+                                ep["sample_response"] = sample;
+                            }
+
+                            endpoints.push(ep);
                         }
                     }
                     _ => continue,
@@ -4776,6 +5697,19 @@ mod tests {
         StackerCommand::ListContainers
     );
     stacker_test!(
+        parses_trigger_pipe_command,
+        "trigger_pipe",
+        json!({
+            "params": {
+                "pipe_instance_id": "11111111-1111-1111-1111-111111111111",
+                "input_data": {
+                    "invoice_id": "inv-1"
+                }
+            }
+        }),
+        StackerCommand::TriggerPipe
+    );
+    stacker_test!(
         parses_stacker_list_containers_command,
         "stacker.list_containers",
         json!({
@@ -4799,6 +5733,264 @@ mod tests {
 
         let parsed = parse_stacker_command(&cmd).unwrap();
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parses_trigger_pipe_external_target_fields() {
+        let cmd = AgentCommand {
+            id: "cmd-trigger".into(),
+            command_id: "cmd-trigger".into(),
+            name: "trigger_pipe".into(),
+            params: json!({
+                "params": {
+                    "pipe_instance_id": "11111111-1111-1111-1111-111111111111",
+                    "target_url": "https://example.com",
+                    "target_endpoint": "/webhook/pipe",
+                    "target_method": "post",
+                    "field_mapping": { "email": "$.user.email" },
+                    "trigger_type": "manual",
+                    "input_data": { "user": { "email": "dev@try.direct" } }
+                }
+            }),
+            deployment_hash: Some("dep-123".into()),
+            app_code: None,
+        };
+
+        let parsed = parse_stacker_command(&cmd).unwrap();
+        match parsed {
+            Some(StackerCommand::TriggerPipe(data)) => {
+                assert_eq!(data.deployment_hash, "dep-123");
+                assert_eq!(data.target_url.as_deref(), Some("https://example.com"));
+                assert_eq!(data.target_endpoint, "/webhook/pipe");
+                assert_eq!(data.target_method, "POST");
+                assert_eq!(data.trigger_type, "manual");
+                assert_eq!(data.field_mapping, Some(json!({ "email": "$.user.email" })));
+            }
+            other => panic!("Expected TriggerPipe command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_trigger_pipe_internal_target_fields() {
+        let cmd = AgentCommand {
+            id: "cmd-trigger".into(),
+            command_id: "cmd-trigger".into(),
+            name: "trigger_pipe".into(),
+            params: json!({
+                "params": {
+                    "pipe_instance_id": "11111111-1111-1111-1111-111111111111",
+                    "target_container": "target-app",
+                    "target_endpoint": "/hooks/pipe",
+                    "target_method": "post",
+                    "field_mapping": { "email": "$.user.email" },
+                    "input_data": { "user": { "email": "dev@try.direct" } }
+                }
+            }),
+            deployment_hash: Some("dep-123".into()),
+            app_code: None,
+        };
+
+        let parsed = parse_stacker_command(&cmd).unwrap();
+        match parsed {
+            Some(StackerCommand::TriggerPipe(data)) => {
+                assert_eq!(data.target_container.as_deref(), Some("target-app"));
+                assert_eq!(data.target_endpoint, "/hooks/pipe");
+                assert_eq!(data.target_method, "POST");
+            }
+            other => panic!("Expected TriggerPipe command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_trigger_pipe_source_fetch_fields() {
+        let cmd = AgentCommand {
+            id: "cmd-trigger".into(),
+            command_id: "cmd-trigger".into(),
+            name: "trigger_pipe".into(),
+            params: json!({
+                "params": {
+                    "pipe_instance_id": "11111111-1111-1111-1111-111111111111",
+                    "source_container": "source-app",
+                    "source_endpoint": "/source/data",
+                    "source_method": "get",
+                    "target_container": "target-app",
+                    "target_endpoint": "/hooks/pipe",
+                    "target_method": "post"
+                }
+            }),
+            deployment_hash: Some("dep-123".into()),
+            app_code: None,
+        };
+
+        let parsed = parse_stacker_command(&cmd).unwrap();
+        match parsed {
+            Some(StackerCommand::TriggerPipe(data)) => {
+                assert_eq!(data.source_container.as_deref(), Some("source-app"));
+                assert_eq!(data.source_endpoint, "/source/data");
+                assert_eq!(data.source_method, "GET");
+                assert_eq!(data.target_container.as_deref(), Some("target-app"));
+            }
+            other => panic!("Expected TriggerPipe command, got {:?}", other),
+        }
+    }
+
+    // --- ContainerRuntime tests ---
+
+    #[test]
+    fn container_runtime_default_is_runc() {
+        let rt = ContainerRuntime::default();
+        assert_eq!(rt, ContainerRuntime::Runc);
+        assert_eq!(rt.to_string(), "runc");
+    }
+
+    #[test]
+    fn container_runtime_kata_display() {
+        let rt = ContainerRuntime::Kata;
+        assert_eq!(rt.to_string(), "kata");
+        assert_eq!(rt.docker_runtime_name(), "io.containerd.kata.v2");
+    }
+
+    #[test]
+    fn container_runtime_runc_docker_name() {
+        assert_eq!(ContainerRuntime::Runc.docker_runtime_name(), "runc");
+    }
+
+    #[test]
+    fn container_runtime_deserializes_from_json() {
+        let kata: ContainerRuntime = serde_json::from_str(r#""kata""#).unwrap();
+        assert_eq!(kata, ContainerRuntime::Kata);
+
+        let runc: ContainerRuntime = serde_json::from_str(r#""runc""#).unwrap();
+        assert_eq!(runc, ContainerRuntime::Runc);
+    }
+
+    #[test]
+    fn container_runtime_rejects_unknown() {
+        let result: Result<ContainerRuntime, _> = serde_json::from_str(r#""gvisor""#);
+        assert!(result.is_err());
+    }
+
+    stacker_test!(
+        parses_deploy_app_with_kata_runtime,
+        "deploy_app",
+        json!({
+            "deployment_hash": "testhash",
+            "app_code": "testapp",
+            "image": "wordpress:latest",
+            "runtime": "kata"
+        }),
+        StackerCommand::DeployApp
+    );
+
+    stacker_test!(
+        parses_deploy_app_with_runc_runtime,
+        "deploy_app",
+        json!({
+            "deployment_hash": "testhash",
+            "app_code": "testapp",
+            "runtime": "runc"
+        }),
+        StackerCommand::DeployApp
+    );
+
+    stacker_test!(
+        parses_deploy_app_without_runtime,
+        "deploy_app",
+        json!({
+            "deployment_hash": "testhash",
+            "app_code": "testapp"
+        }),
+        StackerCommand::DeployApp
+    );
+
+    stacker_test!(
+        parses_deploy_with_configs_with_kata,
+        "deploy_with_configs",
+        json!({
+            "deployment_hash": "testhash",
+            "app_code": "testapp",
+            "runtime": "kata"
+        }),
+        StackerCommand::DeployWithConfigs
+    );
+}
+
+#[cfg(all(test, feature = "docker"))]
+mod runtime_compose_tests {
+    use super::*;
+
+    #[test]
+    fn inject_runtime_into_compose_adds_kata() {
+        let compose = r#"
+services:
+  web:
+    image: wordpress:latest
+    ports:
+      - "8080:80"
+  db:
+    image: mysql:8
+"#;
+        let result = inject_runtime_into_compose(compose, &ContainerRuntime::Kata);
+        let doc: serde_yaml::Value = serde_yaml::from_str(&result).unwrap();
+        let services = doc.get("services").unwrap().as_mapping().unwrap();
+
+        for (_name, svc) in services {
+            let rt = svc.get("runtime").unwrap().as_str().unwrap();
+            assert_eq!(rt, "io.containerd.kata.v2");
+        }
+    }
+
+    #[test]
+    fn inject_runtime_runc_sets_runc() {
+        let compose = r#"
+services:
+  app:
+    image: nginx:latest
+"#;
+        let result = inject_runtime_into_compose(compose, &ContainerRuntime::Runc);
+        let doc: serde_yaml::Value = serde_yaml::from_str(&result).unwrap();
+        let svc = doc.get("services").unwrap().get("app").unwrap();
+        assert_eq!(svc.get("runtime").unwrap().as_str().unwrap(), "runc");
+    }
+
+    #[test]
+    fn inject_runtime_preserves_existing_fields() {
+        let compose = r#"
+services:
+  web:
+    image: wordpress:latest
+    environment:
+      WORDPRESS_DB_HOST: db
+    ports:
+      - "8080:80"
+"#;
+        let result = inject_runtime_into_compose(compose, &ContainerRuntime::Kata);
+        let doc: serde_yaml::Value = serde_yaml::from_str(&result).unwrap();
+        let web = doc.get("services").unwrap().get("web").unwrap();
+
+        assert!(web.get("image").is_some());
+        assert!(web.get("environment").is_some());
+        assert!(web.get("ports").is_some());
+        assert_eq!(
+            web.get("runtime").unwrap().as_str().unwrap(),
+            "io.containerd.kata.v2"
+        );
+    }
+
+    #[test]
+    fn inject_runtime_invalid_yaml_returns_original() {
+        let bad_yaml = "this: is: not: valid: yaml: {{{}}}";
+        let result = inject_runtime_into_compose(bad_yaml, &ContainerRuntime::Kata);
+        assert_eq!(result, bad_yaml);
+    }
+
+    #[test]
+    fn inject_runtime_no_services_key_returns_unchanged() {
+        let compose = "version: '3'\n";
+        let result = inject_runtime_into_compose(compose, &ContainerRuntime::Kata);
+        // Should not crash; YAML is valid but has no services
+        let doc: serde_yaml::Value = serde_yaml::from_str(&result).unwrap();
+        assert!(doc.get("services").is_none());
     }
 }
 
@@ -5369,6 +6561,7 @@ mod probe_endpoints_command_tests {
             container: Some("  crm-web  ".to_string()),
             protocols: vec!["  OpenAPI  ".to_string(), " REST ".to_string()],
             probe_timeout: 5,
+            capture_samples: false,
         };
         let normalized = cmd.normalize();
         assert_eq!(normalized.deployment_hash, "abc123");
@@ -5385,6 +6578,7 @@ mod probe_endpoints_command_tests {
             container: None,
             protocols: vec![],
             probe_timeout: 5,
+            capture_samples: false,
         };
         let normalized = cmd.normalize();
         assert_eq!(normalized.protocols, vec!["openapi", "rest"]);
@@ -5398,6 +6592,7 @@ mod probe_endpoints_command_tests {
             container: None,
             protocols: vec!["openapi".to_string(), "  ".to_string(), "".to_string()],
             probe_timeout: 5,
+            capture_samples: false,
         };
         let normalized = cmd.normalize();
         assert_eq!(normalized.protocols, vec!["openapi"]);
@@ -5411,6 +6606,7 @@ mod probe_endpoints_command_tests {
             container: None,
             protocols: vec!["  ".to_string(), "".to_string()],
             probe_timeout: 5,
+            capture_samples: false,
         };
         let normalized = cmd.normalize();
         assert_eq!(normalized.protocols, vec!["openapi", "rest"]);
@@ -5424,6 +6620,7 @@ mod probe_endpoints_command_tests {
             container: Some("   ".to_string()),
             protocols: vec!["openapi".to_string()],
             probe_timeout: 5,
+            capture_samples: false,
         };
         let normalized = cmd.normalize();
         assert!(normalized.container.is_none());
@@ -5439,6 +6636,7 @@ mod probe_endpoints_command_tests {
             container: None,
             protocols: vec!["openapi".to_string()],
             probe_timeout: 5,
+            capture_samples: false,
         };
         let agent_cmd = AgentCommand {
             id: "test-id".into(),
@@ -5460,6 +6658,7 @@ mod probe_endpoints_command_tests {
             container: None,
             protocols: vec!["openapi".to_string()],
             probe_timeout: 5,
+            capture_samples: false,
         };
         let agent_cmd = AgentCommand {
             id: "test-id".into(),
@@ -5481,6 +6680,7 @@ mod probe_endpoints_command_tests {
             container: None,
             protocols: vec!["openapi".to_string()],
             probe_timeout: 5,
+            capture_samples: false,
         };
         let agent_cmd = AgentCommand {
             id: "test-id".into(),
@@ -5505,6 +6705,7 @@ mod probe_endpoints_command_tests {
             container: None,
             protocols: vec!["openapi".to_string()],
             probe_timeout: 5,
+            capture_samples: false,
         };
         let result = cmd.validate();
         assert!(result.is_err());
@@ -5519,6 +6720,7 @@ mod probe_endpoints_command_tests {
             container: None,
             protocols: vec!["openapi".to_string()],
             probe_timeout: 5,
+            capture_samples: false,
         };
         let result = cmd.validate();
         assert!(result.is_err());
@@ -5533,6 +6735,7 @@ mod probe_endpoints_command_tests {
             container: None,
             protocols: vec!["openapi".to_string(), "invalid_proto".to_string()],
             probe_timeout: 5,
+            capture_samples: false,
         };
         let result = cmd.validate();
         assert!(result.is_err());
@@ -5556,6 +6759,7 @@ mod probe_endpoints_command_tests {
                 "rest".to_string(),
             ],
             probe_timeout: 5,
+            capture_samples: false,
         };
         assert!(cmd.validate().is_ok());
     }
@@ -5568,6 +6772,7 @@ mod probe_endpoints_command_tests {
             container: None,
             protocols: vec!["openapi".to_string()],
             probe_timeout: 5,
+            capture_samples: false,
         };
         assert!(cmd.validate().is_ok());
     }
@@ -5602,7 +6807,7 @@ mod probe_endpoints_command_tests {
             }
         });
 
-        let ops = extract_openapi_operations(&spec);
+        let ops = extract_openapi_operations(&spec, false);
         assert_eq!(ops.len(), 2);
 
         // Find the GET operation
@@ -5638,7 +6843,7 @@ mod probe_endpoints_command_tests {
             }
         });
 
-        let ops = extract_openapi_operations(&spec);
+        let ops = extract_openapi_operations(&spec, false);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0]["method"], "GET");
     }
@@ -5650,7 +6855,7 @@ mod probe_endpoints_command_tests {
             "paths": {}
         });
 
-        let ops = extract_openapi_operations(&spec);
+        let ops = extract_openapi_operations(&spec, false);
         assert!(ops.is_empty());
     }
 
@@ -5661,7 +6866,7 @@ mod probe_endpoints_command_tests {
             "info": { "title": "test" }
         });
 
-        let ops = extract_openapi_operations(&spec);
+        let ops = extract_openapi_operations(&spec, false);
         assert!(ops.is_empty());
     }
 
@@ -5676,9 +6881,190 @@ mod probe_endpoints_command_tests {
             }
         });
 
-        let ops = extract_openapi_operations(&spec);
+        let ops = extract_openapi_operations(&spec, false);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0]["summary"], "");
+    }
+
+    #[test]
+    fn extract_openapi_operations_capture_samples_from_example() {
+        let spec = json!({
+            "openapi": "3.0.0",
+            "paths": {
+                "/api/v1/posts": {
+                    "get": {
+                        "summary": "List posts",
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {
+                                        "example": [
+                                            {"id": 1, "title": "Hello World", "author": 42}
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Without capture_samples
+        let ops = extract_openapi_operations(&spec, false);
+        assert_eq!(ops.len(), 1);
+        assert!(ops[0].get("sample_response").is_none());
+
+        // With capture_samples
+        let ops = extract_openapi_operations(&spec, true);
+        assert_eq!(ops.len(), 1);
+        let sample = &ops[0]["sample_response"];
+        assert!(sample.is_array());
+        assert_eq!(sample[0]["id"], 1);
+        assert_eq!(sample[0]["title"], "Hello World");
+    }
+
+    #[test]
+    fn extract_openapi_operations_capture_samples_from_schema_example() {
+        let spec = json!({
+            "openapi": "3.0.0",
+            "paths": {
+                "/api/users": {
+                    "get": {
+                        "summary": "Get users",
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "example": {"id": 1, "name": "Alice"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let ops = extract_openapi_operations(&spec, true);
+        assert_eq!(ops[0]["sample_response"]["name"], "Alice");
+    }
+
+    #[test]
+    fn extract_openapi_operations_capture_samples_swagger2() {
+        let spec = json!({
+            "swagger": "2.0",
+            "paths": {
+                "/api/items": {
+                    "get": {
+                        "summary": "List items",
+                        "responses": {
+                            "200": {
+                                "examples": {
+                                    "application/json": [
+                                        {"id": 1, "name": "Widget"}
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let ops = extract_openapi_operations(&spec, true);
+        assert_eq!(ops[0]["sample_response"][0]["name"], "Widget");
+    }
+
+    #[test]
+    fn extract_openapi_operations_capture_samples_with_ref() {
+        let spec = json!({
+            "openapi": "3.0.0",
+            "paths": {
+                "/api/posts": {
+                    "get": {
+                        "summary": "List posts",
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "$ref": "#/components/schemas/PostList"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "PostList": {
+                        "type": "array",
+                        "example": [{"id": 1, "title": "First Post"}]
+                    }
+                }
+            }
+        });
+
+        let ops = extract_openapi_operations(&spec, true);
+        assert_eq!(ops[0]["sample_response"][0]["title"], "First Post");
+    }
+
+    #[test]
+    fn probe_endpoints_command_capture_samples_defaults_false() {
+        let cmd: ProbeEndpointsCommand = serde_json::from_value(json!({
+            "app_code": "wordpress"
+        }))
+        .unwrap();
+        assert!(!cmd.capture_samples);
+    }
+
+    #[test]
+    fn probe_endpoints_command_capture_samples_true() {
+        let cmd: ProbeEndpointsCommand = serde_json::from_value(json!({
+            "app_code": "wordpress",
+            "capture_samples": true
+        }))
+        .unwrap();
+        assert!(cmd.capture_samples);
+    }
+
+    #[test]
+    fn extract_response_example_from_direct_example() {
+        let spec = json!({});
+        let operation = json!({
+            "responses": {
+                "200": {
+                    "content": {
+                        "application/json": {
+                            "example": {"id": 1, "name": "Test"}
+                        }
+                    }
+                }
+            }
+        });
+        let sample = extract_response_example(&spec, &operation);
+        assert!(sample.is_some());
+        assert_eq!(sample.unwrap()["name"], "Test");
+    }
+
+    #[test]
+    fn extract_response_example_returns_none_when_missing() {
+        let spec = json!({});
+        let operation = json!({
+            "responses": {
+                "200": {
+                    "description": "Success"
+                }
+            }
+        });
+        let sample = extract_response_example(&spec, &operation);
+        assert!(sample.is_none());
     }
 
     // ==================== EXTRACT_REQUEST_FIELDS TESTS ====================
