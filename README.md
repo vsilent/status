@@ -2,11 +2,10 @@
 
 <img width="200" src="https://raw.githubusercontent.com/trydirect/status/testing/assets/logo/status.png">
 
-# Status Panel
 
 **A lightweight infrastructure agent for server and container management.**
 
-Monitors health, collects metrics, manages Docker containers, and executes commands — all from a single statically-linked binary.
+Monitors health, collects metrics, manages Docker containers, and executes commands - all from a single statically-linked binary.
 
 [![CI](https://github.com/trydirect/status/actions/workflows/ci.yml/badge.svg)](https://github.com/trydirect/status/actions/workflows/ci.yml)
 [![Docker Pulls](https://img.shields.io/docker/pulls/trydirect/status.svg)](https://hub.docker.com/r/trydirect/status)
@@ -37,7 +36,7 @@ curl -sSfL https://raw.githubusercontent.com/trydirect/status/master/install.sh 
 Pin a specific version or choose a custom directory:
 
 ```bash
-VERSION=v0.1.8 curl -sSfL https://raw.githubusercontent.com/trydirect/status/master/install.sh | sh
+VERSION=v0.1.9 curl -sSfL https://raw.githubusercontent.com/trydirect/status/master/install.sh | sh
 INSTALL_DIR=~/.local/bin curl -sSfL https://raw.githubusercontent.com/trydirect/status/master/install.sh | sh
 ```
 
@@ -172,7 +171,12 @@ The local `/api/v1/commands/*` endpoints are the agent's own Axum API surface. W
 | `POST` | `/api/self/update/deploy` | Deploy prepared binary |
 | `POST` | `/api/self/update/rollback` | Restore previous version |
 
-### Stacker Commands (Remote)
+
+### Integrations
+
+[Stacker](https://stacker.my)
+
+Server Commands (Remote)
 
 The agent accepts signed commands from the Stacker dashboard covering the full lifecycle:
 
@@ -209,6 +213,11 @@ The agent accepts signed commands from the Stacker dashboard covering the full l
 
 ## Configuration
 
+`STATUS_PANEL_USERNAME` / `STATUS_PANEL_PASSWORD` only control the Status Panel UI. `configure_proxy`
+uses a separate Nginx Proxy Manager credential resolved from Vault with `STACKER_SERVER_ID`.
+When Stacker sends `ssl_enabled=false` (for example via `stacker agent configure-proxy --no-ssl`),
+the agent creates a plain HTTP proxy host and does not send Let's Encrypt metadata to NPM.
+
 | Environment Variable | Description |
 |---------------------|-------------|
 | `STATUS_PANEL_USERNAME` | **Required.** Login username |
@@ -217,6 +226,9 @@ The agent accepts signed commands from the Stacker dashboard covering the full l
 | `AGENT_TOKEN` | Authentication token for signed requests |
 | `DASHBOARD_URL` | Remote dashboard URL |
 | `VAULT_ADDRESS` | HashiCorp Vault server URL |
+| `STACKER_SERVER_ID` | Stable server UUID used to resolve host-scoped NPM credentials in Vault |
+| `STATUS_PANEL_PROXY_OWNER` | Set `true` on the single agent allowed to manage shared proxy state |
+| `NPM_ALLOW_ENV_FALLBACK` | Temporary migration switch for legacy `NPM_*` env credentials |
 | `UPDATE_SERVER_URL` | Remote update server for version checks |
 | `UPDATE_EXPECTED_SHA256` | Expected SHA256 hash for self-update binary |
 | `COMPOSE_AGENT_ENABLED` | Enable compose-agent mode |

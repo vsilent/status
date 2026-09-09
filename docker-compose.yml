@@ -17,6 +17,8 @@ services:
     environment:
       - NGINX_CONTAINER=nginx
       - COMPOSE_AGENT_ENABLED=true
+      # Container port mapping requires binding all interfaces.
+      - STATUS_PANEL_BIND=0.0.0.0
     # Default: serve with UI
     command: ["serve", "--port", "5000", "--with-ui"]
 
@@ -32,6 +34,7 @@ services:
      - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
      # Mount host path for compose and config files
      - /home/trydirect:/home/trydirect
+     - /opt/stacker:/opt/stacker
     env_file:
       - .env
     environment:
